@@ -259,6 +259,7 @@ class StateGridInfoCurrentMonthCostSensor(StateGridInfoBaseSensor):
         return {
             "当年电费": cost.get("current_year_cost", 0.0),
             "累计电费": cost.get("total_cost", 0.0),
+            "电费是否预估": cost.get("current_month_cost_is_estimated", False),
         }
 
 

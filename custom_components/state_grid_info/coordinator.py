@@ -383,7 +383,219 @@ class StateGridInfoCoordinator(DataUpdateCoordinator):
         snapshot["balance"] = self.data.get("balance", snapshot.get("balance", 0.0))
         snapshot["consumer_name"] = self.data.get("consumer_name", snapshot.get("consumer_name", ""))
         snapshot["last_sync_at"] = self.last_update_time.astimezone().isoformat()
+
+        # ---------------------------------------------------------------
+        # Current-month cost: MQTT sends monthEleCost=0 while the billing
+        # period is still open.  Estimate from daily records and mark the
+        # value as provisional until the next month's official data arrives.
+        # ---------------------------------------------------------------
+        energy = snapshot.get("energy", {})
+        cost = snapshot.get("cost", {})
+        now = datetime.now()
+        current_month_str = now.strftime("%Y-%m")
+        current_year_str = now.strftime("%Y")
+        monthlist = list(overview.get("monthlist", []))
+        if not energy.get("current_month_has_official_cost", False):
+            estimated = await self._async_estimate_current_month_cost(consumer_number)
+            cost["current_month_cost"] = round(estimated, 2)
+            cost["current_month_cost_is_estimated"] = True
+            await self._async_persist_current_month_estimate(
+                consumer_number,
+                current_month_str,
+                estimated,
+            )
+
+            month_found = False
+            for month_item in monthlist:
+                if str(month_item.get("month", "")) == current_month_str:
+                    month_item["monthEleCost"] = round(estimated, 2)
+                    month_item["monthEleCostIsEstimated"] = True
+                    month_found = True
+                    break
+
+            if not month_found:
+                monthlist.append(
+                    {
+                        "month": current_month_str,
+                        "monthEleNum": round(float(energy.get("current_month_kwh", 0.0)), 2),
+                        "monthEleCost": round(estimated, 2),
+                        "monthTPq": 0.0,
+                        "monthPPq": 0.0,
+                        "monthNPq": 0.0,
+                        "monthVPq": 0.0,
+                        "monthEleCostIsEstimated": True,
+                    }
+                )
+        else:
+            cost["current_month_cost_is_estimated"] = False
+
+        # Keep year/total values aligned with monthlist so current month
+        # provisional values are reflected everywhere consistently.
+        monthlist = sorted(monthlist, key=lambda x: x.get("month", ""), reverse=True)
+        overview["monthlist"] = monthlist
+
+        current_year_cost = sum(
+            float(m.get("monthEleCost", 0.0))
+            for m in monthlist
+            if str(m.get("month", "")).startswith(current_year_str)
+        )
+        total_cost = sum(float(m.get("monthEleCost", 0.0)) for m in monthlist)
+        current_year_kwh = sum(
+            float(m.get("monthEleNum", 0.0))
+            for m in monthlist
+            if str(m.get("month", "")).startswith(current_year_str)
+        )
+        total_kwh = sum(float(m.get("monthEleNum", 0.0)) for m in monthlist)
+
+        cost["current_year_cost"] = round(current_year_cost, 2)
+        cost["total_cost"] = round(total_cost, 2)
+        energy["current_year_kwh"] = round(current_year_kwh, 2)
+        energy["total_energy_kwh"] = round(total_kwh, 2)
+
+        yearlist = list(overview.get("yearlist", []))
+        year_map: dict[str, dict[str, Any]] = {
+            str(y.get("year", "")): dict(y)
+            for y in yearlist
+            if str(y.get("year", ""))
+        }
+        year_entry = year_map.get(
+            current_year_str,
+            {
+                "year": current_year_str,
+                "yearEleNum": 0.0,
+                "yearEleCost": 0.0,
+                "yearTPq": 0.0,
+                "yearPPq": 0.0,
+                "yearNPq": 0.0,
+                "yearVPq": 0.0,
+            },
+        )
+        year_entry["yearEleNum"] = round(current_year_kwh, 2)
+        year_entry["yearEleCost"] = round(current_year_cost, 2)
+        year_entry["yearTPq"] = round(
+            sum(
+                float(m.get("monthTPq", 0.0))
+                for m in monthlist
+                if str(m.get("month", "")).startswith(current_year_str)
+            ),
+            2,
+        )
+        year_entry["yearPPq"] = round(
+            sum(
+                float(m.get("monthPPq", 0.0))
+                for m in monthlist
+                if str(m.get("month", "")).startswith(current_year_str)
+            ),
+            2,
+        )
+        year_entry["yearNPq"] = round(
+            sum(
+                float(m.get("monthNPq", 0.0))
+                for m in monthlist
+                if str(m.get("month", "")).startswith(current_year_str)
+            ),
+            2,
+        )
+        year_entry["yearVPq"] = round(
+            sum(
+                float(m.get("monthVPq", 0.0))
+                for m in monthlist
+                if str(m.get("month", "")).startswith(current_year_str)
+            ),
+            2,
+        )
+        year_map[current_year_str] = year_entry
+        overview["yearlist"] = sorted(year_map.values(), key=lambda x: x.get("year", ""), reverse=True)
+
+        snapshot["overview"] = overview
+        snapshot["cost"] = cost
+        snapshot["energy"] = energy
+
         self.runtime_snapshot = snapshot
+
+    async def _async_estimate_current_month_cost(self, consumer_number: str) -> float:
+        """Sum calculated daily costs for the current month's stored records.
+
+        Used when the data source has not yet provided an official billed cost
+        for the current month (monthEleCost == 0 from MQTT while open).
+        """
+        now = datetime.now()
+        current_month_str = now.strftime("%Y-%m")
+        account = await self.storage.async_get_account(consumer_number)
+        daily = account.get("daily", {})
+
+        total = 0.0
+        for day_key, rec in daily.items():
+            if day_key.startswith(current_month_str):
+                total += await self._async_calculate_daily_cost(rec)
+        return round(total, 2)
+
+    async def _async_persist_current_month_estimate(
+        self,
+        consumer_number: str,
+        month_key: str,
+        month_cost: float,
+    ) -> None:
+        """Persist provisional current-month cost into storage monthly/yearly.
+
+        This keeps storage-consumers (and manual storage inspection) aligned
+        with the runtime snapshot while the month is still open.
+        """
+        account = await self.storage.async_get_account(consumer_number)
+        monthly = account.setdefault("monthly", {})
+        yearly = account.setdefault("yearly", {})
+
+        month_entry = monthly.setdefault(
+            month_key,
+            {
+                "month": month_key,
+                "monthEleNum": 0.0,
+                "monthEleCost": 0.0,
+                "monthTPq": 0.0,
+                "monthPPq": 0.0,
+                "monthNPq": 0.0,
+                "monthVPq": 0.0,
+            },
+        )
+
+        new_cost = round(float(month_cost), 2)
+        changed = round(float(month_entry.get("monthEleCost", 0.0)), 2) != new_cost
+        if not bool(month_entry.get("monthEleCostIsEstimated", False)):
+            changed = True
+        month_entry["monthEleCost"] = new_cost
+        month_entry["monthEleCostIsEstimated"] = True
+
+        year_key = month_key[:4]
+        year_entry = yearly.setdefault(
+            year_key,
+            {
+                "year": year_key,
+                "yearEleNum": 0.0,
+                "yearEleCost": 0.0,
+                "yearTPq": 0.0,
+                "yearPPq": 0.0,
+                "yearNPq": 0.0,
+                "yearVPq": 0.0,
+            },
+        )
+
+        year_months = [m for mk, m in monthly.items() if str(mk).startswith(year_key)]
+        recomputed_year = {
+            "yearEleNum": round(sum(float(m.get("monthEleNum", 0.0)) for m in year_months), 2),
+            "yearEleCost": round(sum(float(m.get("monthEleCost", 0.0)) for m in year_months), 2),
+            "yearTPq": round(sum(float(m.get("monthTPq", 0.0)) for m in year_months), 2),
+            "yearPPq": round(sum(float(m.get("monthPPq", 0.0)) for m in year_months), 2),
+            "yearNPq": round(sum(float(m.get("monthNPq", 0.0)) for m in year_months), 2),
+            "yearVPq": round(sum(float(m.get("monthVPq", 0.0)) for m in year_months), 2),
+        }
+
+        for k, v in recomputed_year.items():
+            if round(float(year_entry.get(k, 0.0)), 2) != v:
+                year_entry[k] = v
+                changed = True
+
+        if changed:
+            await self.storage.async_save()
 
     async def _async_get_resolved_lists(
         self,

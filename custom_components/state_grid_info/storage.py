@@ -485,14 +485,33 @@ class StateGridStorage:
         current_month_str = now.strftime("%Y-%m")
         current_year_str = now.strftime("%Y")
         current_month_entry = monthly.get(current_month_str, {})
-        current_year_entry = yearly.get(current_year_str, {})
 
-        total_energy = sum(float(entry.get("yearEleNum", 0)) for entry in yearly.values())
-        total_cost = sum(float(entry.get("yearEleCost", 0)) for entry in yearly.values())
-        if total_energy <= 0:
-            total_energy = sum(float(entry.get("monthEleNum", 0)) for entry in monthly.values())
-        if total_cost <= 0:
-            total_cost = sum(float(entry.get("monthEleCost", 0)) for entry in monthly.values())
+        # Compute current-year totals directly from monthly entries so that the
+        # current (not-yet-billed) month's daily-accumulated kWh is always
+        # included, even when source_yearly only covers completed months.
+        current_year_kwh = round(sum(
+            float(m.get("monthEleNum", 0))
+            for ym, m in monthly.items()
+            if ym.startswith(current_year_str)
+        ), 2)
+        current_year_cost = round(sum(
+            float(m.get("monthEleCost", 0))
+            for ym, m in monthly.items()
+            if ym.startswith(current_year_str)
+        ), 2)
+
+        # Lifetime totals from monthly so the current month is never silently
+        # omitted (source_yearly may not include it yet).
+        total_energy = round(sum(float(m.get("monthEleNum", 0)) for m in monthly.values()), 2)
+        total_cost = round(sum(float(m.get("monthEleCost", 0)) for m in monthly.values()), 2)
+
+        # Flag used by the coordinator to decide whether to estimate cost.
+        # True only when the source explicitly provided a non-zero billed cost
+        # for the current month (i.e., the month has already been settled).
+        source_monthly = account.get("source_monthly", {})
+        current_month_has_official_cost = (
+            float(source_monthly.get(current_month_str, {}).get("monthEleCost", 0)) > 0
+        )
 
         return {
             "consumer_number": consumer_number,
@@ -506,14 +525,15 @@ class StateGridStorage:
             },
             "energy": {
                 "current_month_kwh": current_month_entry.get("monthEleNum", 0.0),
-                "current_year_kwh": current_year_entry.get("yearEleNum", 0.0),
-                "total_energy_kwh": round(total_energy, 2),
+                "current_year_kwh": current_year_kwh,
+                "total_energy_kwh": total_energy,
                 "last_official_day": meta.get("last_official_day", ""),
+                "current_month_has_official_cost": current_month_has_official_cost,
             },
             "cost": {
                 "current_month_cost": current_month_entry.get("monthEleCost", 0.0),
-                "current_year_cost": current_year_entry.get("yearEleCost", 0.0),
-                "total_cost": round(total_cost, 2),
+                "current_year_cost": current_year_cost,
+                "total_cost": total_cost,
             },
         }
 
