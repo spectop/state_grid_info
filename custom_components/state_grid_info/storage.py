@@ -287,15 +287,24 @@ class StateGridStorage:
                 m[k] = round(m[k], 2)
 
         # 抓取值优先：同月存在 source_monthly 时，以 source 字段覆盖计算字段。
+        # 但当 source 字段为 0 时（未结账的当月），不覆盖计算值，避免丢失日汇总估算。
         source_monthly = account.get("source_monthly", {})
         resolved_monthly: dict[str, dict] = {}
         all_months = set(calculated_monthly.keys()) | set(source_monthly.keys())
 
         for month in all_months:
-            merged = {}
-            merged.update(calculated_monthly.get(month, {}))
-            merged.update(source_monthly.get(month, {}))
-            merged["month"] = month
+            calc = calculated_monthly.get(month, {})
+            src = source_monthly.get(month, {})
+            merged = {"month": month}
+            merged.update(calc)
+            # 仅当 source 值非零时才覆盖计算值（0 表示账单未出，不可信）
+            for k in ("monthEleNum", "monthEleCost", "monthTPq", "monthPPq", "monthNPq", "monthVPq"):
+                src_val = float(src.get(k, 0))
+                if src_val != 0:
+                    merged[k] = src_val
+            # 保留 source 的元数据字段
+            if "source_updated_at" in src:
+                merged["source_updated_at"] = src["source_updated_at"]
             for k in ("monthEleNum", "monthEleCost", "monthTPq", "monthPPq", "monthNPq", "monthVPq"):
                 merged[k] = round(float(merged.get(k, 0)), 2)
             resolved_monthly[month] = merged
@@ -332,15 +341,26 @@ class StateGridStorage:
             for k in ("yearEleNum", "yearEleCost", "yearTPq", "yearPPq", "yearNPq", "yearVPq"):
                 y[k] = round(y[k], 2)
 
+        # 对年汇总：source_yearly 可能来自已结算的历史年份，对当前开放年不含未结账月。
+        # 取计算值与 source 值中较大的，确保当前年包含估算月费用。
         source_yearly = account.get("source_yearly", {})
         resolved_yearly: dict[str, dict] = {}
         all_years = set(calculated_yearly.keys()) | set(source_yearly.keys())
 
         for year in all_years:
-            merged = {}
-            merged.update(calculated_yearly.get(year, {}))
-            merged.update(source_yearly.get(year, {}))
-            merged["year"] = year
+            calc = calculated_yearly.get(year, {})
+            src = source_yearly.get(year, {})
+            merged = {"year": year}
+            merged.update(calc)
+            # 对电量和费用：取 max(calc, source)，避免 source 遗漏当前月导致数值偏低
+            for k in ("yearEleNum", "yearEleCost", "yearTPq", "yearPPq", "yearNPq", "yearVPq"):
+                src_val = float(src.get(k, 0))
+                calc_val = float(calc.get(k, 0))
+                if src_val > calc_val:
+                    merged[k] = src_val
+            # 保留 source 的元数据字段
+            if "source_updated_at" in src:
+                merged["source_updated_at"] = src["source_updated_at"]
             for k in ("yearEleNum", "yearEleCost", "yearTPq", "yearPPq", "yearNPq", "yearVPq"):
                 merged[k] = round(float(merged.get(k, 0)), 2)
             resolved_yearly[year] = merged
