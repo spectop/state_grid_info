@@ -124,6 +124,10 @@ class StateGridInfoCoordinator(DataUpdateCoordinator):
         }
         await self._async_rebuild_runtime_snapshot()
 
+        # Reload/periodic refresh should also retry delayed statistics import,
+        # not only on new payload arrival.
+        await self._async_maybe_import_statistics(consumer_number)
+
     async def _async_ensure_daily_costs_calculated(self, consumer_number: str) -> None:
         """确保历史日数据中的 dayEleCost 已计算，处理升级情况。"""
         account = await self.storage.async_get_account(consumer_number)

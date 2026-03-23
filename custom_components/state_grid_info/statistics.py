@@ -17,8 +17,12 @@ import logging
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
-from homeassistant.components.recorder.statistics import async_import_statistics
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
+from homeassistant.components.recorder.statistics import async_add_external_statistics
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
@@ -83,11 +87,13 @@ async def async_import_energy_statistics(
 
     stat_id = _statistic_id(consumer_number)
     metadata = StatisticMetaData(
+        mean_type=StatisticMeanType.NONE,
         has_mean=False,
         has_sum=True,
         name=f"国家电网 {consumer_number} 累计用电",
         source=DOMAIN,
         statistic_id=stat_id,
+        unit_class="energy",
         unit_of_measurement="kWh",
     )
 
@@ -129,12 +135,15 @@ async def async_import_energy_statistics(
         return
 
     try:
-        # async_import_statistics 本身是同步调用，内部调度到 recorder 线程
-        async_import_statistics(hass, metadata, stats)
+        # 外部统计必须使用 async_add_external_statistics；
+        # 否则带 ':' 的 statistic_id 会在内部统计校验中触发 Invalid statistic_id。
+        async_add_external_statistics(hass, metadata, stats)
     except Exception as exc:
         # 导入失败时不推进游标，等待下次 payload 重试
         _LOGGER.error(
-            "能源统计导入失败，游标保持不变，下次 payload 将重试: %s", exc
+            "能源统计导入失败，游标保持不变，下次 payload 将重试: %s (statistic_id=%s)",
+            exc,
+            stat_id,
         )
         return
 
