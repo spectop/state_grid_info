@@ -83,15 +83,46 @@ class StateGridInfoCoordinator(DataUpdateCoordinator):
             return
 
         await self.storage.async_load()
-        await self._async_restore_from_storage()
-        
-        # 确保历史数据中的 dayEleCost 已计算
-        consumer_number = str(self.config.get(CONF_CONSUMER_NUMBER, ""))
-        if consumer_number:
-            await self._async_ensure_daily_costs_calculated(consumer_number)
-        
+        await self._async_refresh_from_storage()
         self._setup_data_source()
         self._initialized = True
+
+    async def _async_refresh_from_storage(self) -> None:
+        """Rebuild derived data and runtime snapshot from persisted storage.
+
+        This path is used on integration reload and periodic coordinator refresh
+        so derived month/year values stay consistent even without a new MQTT
+        payload.
+        """
+        consumer_number = str(self.config.get(CONF_CONSUMER_NUMBER, ""))
+        if not consumer_number:
+            return
+
+        await self._async_restore_from_storage()
+        await self._async_ensure_daily_costs_calculated(consumer_number)
+
+        account = await self.storage.async_get_account(consumer_number)
+        if not account.get("daily") and not account.get("monthly") and not account.get("yearly"):
+            return
+
+        await self.storage.async_rebuild_monthly(consumer_number)
+        await self.storage.async_rebuild_yearly(consumer_number)
+        await self.storage.async_save()
+
+        day_list, month_list, year_list = await self._async_get_resolved_lists(consumer_number)
+        meta = account.get("meta", {})
+        self.data = {
+            "date": meta.get("last_payload_at", self.data.get("date", "")),
+            "balance": float(meta.get("last_balance", self.data.get("balance", 0))),
+            "dayList": day_list,
+            "monthList": month_list,
+            "yearList": year_list,
+            "consumer_name": meta.get(
+                "consumer_name",
+                self.config.get(CONF_CONSUMER_NAME, ""),
+            ),
+        }
+        await self._async_rebuild_runtime_snapshot()
 
     async def _async_ensure_daily_costs_calculated(self, consumer_number: str) -> None:
         """确保历史日数据中的 dayEleCost 已计算，处理升级情况。"""
@@ -107,12 +138,7 @@ class StateGridInfoCoordinator(DataUpdateCoordinator):
         
         if updated:
             _LOGGER.info("Updated daily cost calculations for historic records")
-            # 重建月年汇总数据以包含新计算的费用
-            await self.storage.async_rebuild_monthly(consumer_number)
-            await self.storage.async_rebuild_yearly(consumer_number)
             await self.storage.async_save()
-            # 重建运行时快照
-            await self._async_rebuild_runtime_snapshot()
 
     async def async_unload(self) -> None:
         """Clean up connections and persist pending storage changes."""
@@ -253,6 +279,7 @@ class StateGridInfoCoordinator(DataUpdateCoordinator):
             if source == DATA_SOURCE_QINGLONG:
                 if not self.mqtt_client or not self.mqtt_client.is_connected():
                     self._setup_mqtt_client()
+                await self._async_refresh_from_storage()
                 return self.data
 
             return self.data

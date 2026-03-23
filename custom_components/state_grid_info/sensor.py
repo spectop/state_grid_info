@@ -73,12 +73,12 @@ class StateGridInfoBaseSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def available(self) -> bool:
-        """Return whether the entity has recent data available."""
-        if not self.coordinator.data:
-            return False
+        """Return whether the entity is available.
 
-        time_diff = datetime.now().astimezone() - self.coordinator.last_update_time.astimezone()
-        return time_diff.total_seconds() <= 3600
+        State Grid data is delayed by design, so previously cached data should
+        remain available even when no fresh payload arrives for a long period.
+        """
+        return bool(self.coordinator.runtime_snapshot or self.coordinator.data)
 
     @property
     def device_info(self) -> dict[str, Any]:
